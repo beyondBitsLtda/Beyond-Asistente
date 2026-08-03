@@ -39,6 +39,7 @@ export async function* chatStream(prompt, systemInstruction) {
     config: systemInstruction ? { systemInstruction } : undefined,
   });
   for await (const chunk of stream) {
-    if (chunk.text) yield chunk.text;
+    const text = chunk.text;
+    if (text) yield text;
   }
 }

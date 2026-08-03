@@ -1,61 +1,92 @@
-import { retrieve, buildPrompt, SYSTEM_INSTRUCTION } from "@/lib/rag.js";
-import { chatStream } from "@/lib/gemini.js";
+import { supabase } from "@/lib/supabase.js";
+import { embed } from "@/lib/gemini.js";
+import { chunkText } from "@/lib/ingest/chunk.js";
+import { loadTrello } from "@/lib/ingest/trello.js";
+import { loadBrain } from "@/lib/ingest/brain.js";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const maxDuration = 300; // até 5 min (planos pagos) — Hobby limita a 60s
+
+const EMBED_BATCH = 32;
+const UPSERT_BATCH = 100;
 
 /**
- * POST /api/ask
- * body: { question: string, filterSource?: 'trello' | 'brain' }
+ * POST /api/ingest   (também aceita GET, pra facilitar disparo pelo navegador)
+ * Header: x-ingest-secret: <INGEST_SECRET>   OU   ?secret=<INGEST_SECRET>
  *
- * Responde via SSE (Server-Sent Events) com três tipos de evento,
- * que mapeiam direto para o HUD:
- *   - "context": os cards recuperados (coluna RETRIEVED_CONTEXT)
- *   - "token":   pedaços da resposta (linha de transcript, estado SPEAKING)
- *   - "done":    fim do stream
+ * Se INGEST_SECRET estiver vazio no .env, a rota fica aberta (útil só em teste).
+ * Em produção: preencha INGEST_SECRET e sempre envie o segredo.
  */
-export async function POST(req) {
-  const { question, filterSource = null } = await req.json();
-
-  if (!question || typeof question !== "string") {
-    return new Response(JSON.stringify({ error: "question é obrigatório" }), {
-      status: 400,
-      headers: { "content-type": "application/json" },
-    });
+async function handle(req) {
+  // ---- autorização ----
+  const need = (process.env.INGEST_SECRET || "").trim();
+  if (need) {
+    const url = new URL(req.url);
+    const got = req.headers.get("x-ingest-secret") || url.searchParams.get("secret") || "";
+    if (got !== need) {
+      return json({ ok: false, error: "unauthorized" }, 401);
+    }
   }
 
-  const encoder = new TextEncoder();
-  const send = (controller, event, data) =>
-    controller.enqueue(
-      encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
-    );
+  const report = { trello: 0, brain: 0, chunks: 0, upserted: 0, errors: [] };
 
-  const stream = new ReadableStream({
-    async start(controller) {
-      try {
-        // 1) Recuperar contexto
-        const matches = await retrieve(question, { filterSource });
-        send(controller, "context", matches);
+  try {
+    const [trello, brain] = await Promise.all([loadTrello(), loadBrain()]);
+    report.trello = trello.length;
+    report.brain = brain.length;
 
-        // 2) Montar prompt e transmitir a resposta do Gemini
-        const prompt = buildPrompt(question, matches);
-        for await (const piece of chatStream(prompt, SYSTEM_INSTRUCTION)) {
-          send(controller, "token", piece);
-        }
+    const records = [];
+    for (const doc of [...trello, ...brain]) {
+      const chunks = chunkText(doc.content);
+      chunks.forEach((chunk, i) => {
+        records.push({
+          source: doc.source,
+          external_id: `${doc.external_id}#${i}`,
+          board: doc.board,
+          title: doc.title,
+          content: chunk,
+          last_modified: doc.last_modified,
+          metadata: doc.metadata || {},
+        });
+      });
+    }
+    report.chunks = records.length;
 
-        send(controller, "done", { ok: true });
-      } catch (err) {
-        send(controller, "error", { message: String(err?.message || err) });
-      } finally {
-        controller.close();
-      }
-    },
-  });
+    if (!records.length) {
+      return json({ ok: true, ...report, note: "nada a indexar" });
+    }
 
-  return new Response(stream, {
-    headers: {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache, no-transform",
-      connection: "keep-alive",
-    },
+    // embeddings em lote
+    for (let i = 0; i < records.length; i += EMBED_BATCH) {
+      const batch = records.slice(i, i + EMBED_BATCH);
+      const vectors = await embed(batch.map((r) => r.content), "RETRIEVAL_DOCUMENT");
+      batch.forEach((r, j) => (r.embedding = vectors[j]));
+    }
+
+    // upsert em lote (idempotente por source+external_id)
+    for (let i = 0; i < records.length; i += UPSERT_BATCH) {
+      const batch = records.slice(i, i + UPSERT_BATCH);
+      const { error } = await supabase
+        .from("documents")
+        .upsert(batch, { onConflict: "source,external_id" });
+      if (error) throw new Error(`upsert: ${error.message}`);
+      report.upserted += batch.length;
+    }
+
+    return json({ ok: true, ...report });
+  } catch (err) {
+    report.errors.push(String(err?.message || err));
+    return json({ ok: false, ...report }, 500);
+  }
+}
+
+export const GET = handle;
+export const POST = handle;
+
+function json(body, status = 200) {
+  return new Response(JSON.stringify(body, null, 2), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
   });
 }

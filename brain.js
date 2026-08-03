@@ -1,58 +1,39 @@
+import { supabase } from "../supabase.js";
+
+const USER_ID = (process.env.BRAIN_USER_ID || "").trim();
+
 /**
- * Ingestão do "Beyond Brain" (cérebro digital).
- *
- * >>> PONTO DE INTEGRAÇÃO <<<
- * Quando você anexar o código do app do cérebro, implemente aqui a leitura
- * da fonte real (banco próprio, API, arquivos, etc.) e devolva o mesmo
- * formato de documento usado no resto do pipeline.
- *
- * Enquanto isso, o fallback abaixo lê notas .md de uma pasta (BRAIN_NOTES_DIR),
- * o que já deixa o RAG funcionando com seus estudos/anotações.
+ * Lê as notas do Beyond Brain (tabela `notes` do mesmo projeto Supabase).
+ * Colunas: id, user_id, subject, moment, body, ref, created_at.
+ * Retorna documentos prontos para indexar.
  */
+export async function loadBrain() {
+  let query = supabase
+    .from("notes")
+    .select("id, user_id, subject, moment, body, ref, created_at")
+    .order("created_at", { ascending: false });
 
-import { readdir, readFile, stat } from "node:fs/promises";
-import { join, extname, basename } from "node:path";
+  if (USER_ID) query = query.eq("user_id", USER_ID);
 
-const NOTES_DIR = process.env.BRAIN_NOTES_DIR || "./brain-notes";
-
-export async function loadBrainDocuments() {
-  // TODO: substituir por leitura da fonte real do Beyond Brain.
-  return loadMarkdownNotes(NOTES_DIR);
-}
-
-/** Fallback: lê recursivamente arquivos .md/.txt de uma pasta. */
-async function loadMarkdownNotes(dir) {
-  let entries;
-  try {
-    entries = await readdir(dir, { withFileTypes: true });
-  } catch {
-    console.warn(`[brain] pasta "${dir}" não encontrada — pulando Brain.`);
+  const { data, error } = await query;
+  if (error) {
+    console.error(`[brain] falha ao ler notes: ${error.message}`);
     return [];
   }
 
-  const docs = [];
-  for (const entry of entries) {
-    const full = join(dir, entry.name);
-    if (entry.isDirectory()) {
-      docs.push(...(await loadMarkdownNotes(full)));
-      continue;
-    }
-    if (![".md", ".txt"].includes(extname(entry.name).toLowerCase())) continue;
-
-    const content = await readFile(full, "utf8");
-    const info = await stat(full);
-    docs.push({
-      id: `brain:${full}`,
+  const docs = (data || []).map((n) => {
+    const content = [n.subject, n.moment, n.body].filter(Boolean).join("\n");
+    return {
       source: "brain",
-      board: "Beyond Brain",
-      title: basename(entry.name).replace(/\.(md|txt)$/i, ""),
+      external_id: String(n.id),
+      board: n.ref || "nota",
+      title: n.subject || "(sem assunto)",
       content,
-      url: null,
-      last_modified: info.mtime.toISOString(),
-      metadata: { path: full },
-    });
-  }
+      last_modified: n.created_at || null,
+      metadata: { ref: n.ref || null, moment: n.moment || null, user_id: n.user_id },
+    };
+  });
 
-  console.log(`[brain] ${docs.length} notas carregadas de "${dir}".`);
+  console.log(`[brain] ${docs.length} notas lidas`);
   return docs;
 }

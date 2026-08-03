@@ -1,76 +1,64 @@
-/**
- * Pipeline de ingestão.
- *   node --env-file=.env scripts/ingest.mjs
- *
- * Fluxo: carrega fontes → divide em chunks → gera embeddings em lote →
- *        upsert no pgvector (Supabase).
- */
-
-import { loadTrelloDocuments } from "../src/lib/ingest/trello.js";
-import { loadBrainDocuments } from "../src/lib/ingest/brain.js";
-import { chunkText } from "../src/lib/ingest/chunk.js";
-import { embed } from "../src/lib/gemini.js";
+// Uso: npm run ingest
+// Carrega Trello + Beyond Brain → chunk → embeddings → upsert no pgvector.
 import { supabase } from "../src/lib/supabase.js";
+import { embed } from "../src/lib/gemini.js";
+import { chunkText } from "../src/lib/ingest/chunk.js";
+import { loadTrello } from "../src/lib/ingest/trello.js";
+import { loadBrain } from "../src/lib/ingest/brain.js";
 
-const BATCH = 50; // embeddings por chamada
+const EMBED_BATCH = 32;
+const UPSERT_BATCH = 100;
 
 async function main() {
-  console.log("→ Carregando fontes...");
-  const sources = await Promise.all([
-    loadTrelloDocuments(),
-    loadBrainDocuments(),
-  ]);
-  const documents = sources.flat();
+  console.log("→ carregando fontes…");
+  const [trello, brain] = await Promise.all([loadTrello(), loadBrain()]);
+  const sources = [...trello, ...brain];
+  console.log(`→ ${sources.length} itens brutos (trello=${trello.length}, brain=${brain.length})`);
 
-  // Expande cada documento em seus chunks
-  const rows = [];
-  for (const doc of documents) {
+  // 1) explode em chunks
+  const records = [];
+  for (const doc of sources) {
     const chunks = chunkText(doc.content);
-    chunks.forEach((content, i) => {
-      rows.push({
-        ...doc,
-        id: chunks.length > 1 ? `${doc.id}#${i}` : doc.id,
-        content,
+    chunks.forEach((chunk, i) => {
+      records.push({
+        source: doc.source,
+        external_id: `${doc.external_id}#${i}`,
+        board: doc.board,
+        title: doc.title,
+        content: chunk,
+        last_modified: doc.last_modified,
+        metadata: doc.metadata || {},
       });
     });
   }
-
-  if (!rows.length) {
-    console.log("Nada para indexar. Verifique .env e as fontes.");
+  console.log(`→ ${records.length} chunks para embeddar`);
+  if (!records.length) {
+    console.log("nada a indexar. verifique as chaves/boards no .env.");
     return;
   }
-  console.log(`→ ${rows.length} chunks a embeddar.`);
 
-  // Embedda e faz upsert em lotes
-  for (let i = 0; i < rows.length; i += BATCH) {
-    const batch = rows.slice(i, i + BATCH);
-    const vectors = await embed(
-      batch.map((r) => r.content),
-      "RETRIEVAL_DOCUMENT"
-    );
-
-    const payload = batch.map((r, j) => ({
-      id: r.id,
-      source: r.source,
-      board: r.board,
-      title: r.title,
-      content: r.content,
-      url: r.url,
-      last_modified: r.last_modified,
-      metadata: r.metadata || {},
-      embedding: vectors[j],
-    }));
-
-    const { error } = await supabase.from("documents").upsert(payload);
-    if (error) throw new Error(`upsert falhou: ${error.message}`);
-
-    console.log(`   ✓ ${Math.min(i + BATCH, rows.length)}/${rows.length}`);
+  // 2) embeddings em lotes
+  for (let i = 0; i < records.length; i += EMBED_BATCH) {
+    const batch = records.slice(i, i + EMBED_BATCH);
+    const vectors = await embed(batch.map((r) => r.content), "RETRIEVAL_DOCUMENT");
+    batch.forEach((r, j) => (r.embedding = vectors[j]));
+    process.stdout.write(`\r  embeddings ${Math.min(i + EMBED_BATCH, records.length)}/${records.length}`);
   }
+  console.log("");
 
-  console.log("✅ Ingestão concluída.");
+  // 3) upsert em lotes (idempotente por source+external_id)
+  for (let i = 0; i < records.length; i += UPSERT_BATCH) {
+    const batch = records.slice(i, i + UPSERT_BATCH);
+    const { error } = await supabase
+      .from("documents")
+      .upsert(batch, { onConflict: "source,external_id" });
+    if (error) throw new Error(`upsert: ${error.message}`);
+    process.stdout.write(`\r  upsert ${Math.min(i + UPSERT_BATCH, records.length)}/${records.length}`);
+  }
+  console.log("\n✓ ingestão concluída.");
 }
 
-main().catch((e) => {
-  console.error("❌", e);
+main().catch((err) => {
+  console.error("\n✗ erro na ingestão:", err.message);
   process.exit(1);
 });
